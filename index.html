@@ -8,29 +8,13 @@
   html,body{height:100%;margin:0}
   body{display:flex;align-items:center;justify-content:center;background:#f5f5f5}
   #dl{padding:18px 64px;font-size:22px;border:none;border-radius:12px;
-      background:#1f6feb;color:#fff;cursor:pointer}
+      background:#1f6feb;color:#fff;cursor:pointer;text-decoration:none;
+      font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
   #dl:hover{background:#1a5cd0}
   #dl:active{transform:scale(.97)}
 </style>
 </head>
 <body>
-<button id="dl" onclick="dl()">下载</button>
-<script>
-async function dl(){
-  const url='https://raw.githubusercontent.com/3641156450/meituan-phone-change-auto/main/auto_change_phone.py';
-  try{
-    const r=await fetch(url);
-    if(!r.ok) throw new Error(r.status);
-    const b=await r.blob();
-    const u=URL.createObjectURL(b);
-    const a=document.createElement('a');
-    a.href=u;a.download='auto_change_phone.py';
-    document.body.appendChild(a);a.click();a.remove();
-    URL.revokeObjectURL(u);
-  }catch(e){
-    window.open(url,'_blank');
-  }
-}
-</script>
+<a id="dl" href="auto_change_phone.py" download="auto_change_phone.py">下载</a>
 </body>
 </html>
