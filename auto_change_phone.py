@@ -13,7 +13,6 @@ import random
 import re
 import socket
 import struct
-import subprocess
 import sys
 import tempfile
 import threading
@@ -24,8 +23,11 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 
 
-SCRIPT_VERSION = "R37"
+SCRIPT_VERSION = "R39"
 MEITUAN_PKG = "com.sankuai.meituan"
+# 验证码弹窗「刷新」按钮固定位置（vivo 实测：弹窗右下；刷新换题
+# 供 _stuck_escalate / solve_icon_click_captcha / handle_yoda_tap_captcha）
+YODA_REFRESH_XY = (0.843, 0.686)
 DUMP_PATH = "/sdcard/mt_auto_uidump.xml"
 TOUCHD_PATH = "/data/local/tmp/touchd"
 TOUCHD_B64 = (
@@ -1599,9 +1601,9 @@ def _whip_progress(n, rng=None):
 
 
 # ============================================================================
-# 纯 socket ADB 传输层（R37：零 adb.exe 依赖，仅标准库）
+# 纯 socket ADB 传输层（R39：零 adb.exe、零第三方包，仅标准库）
 # ----------------------------------------------------------------------------
-# 脚本自身不调用 adb.exe；两条通道自动选择：
+# 脚本自身不调用 adb.exe，不 import 任何第三方包；两条通道自动选择：
 #   A. server 通道 —— 连接本机已运行的 adb server（127.0.0.1:5037，兼容
 #      ANDROID_ADB_SERVER_PORT 环境变量与 --adb-server）。server 通常由
 #      模拟器自带 adb 自动拉起；USB 真机走此通道。
@@ -1652,9 +1654,9 @@ _NO_DEVICE_MSG = (
     "  1. 启动模拟器（自动扫描 MuMu/雷电/夜神/逍遥/BlueStacks 等常用端口）；\n"
     "  2. 真机开启「无线调试」或执行一次 adb tcpip 5555 后用 "
     "--serial ip:5555 指定；\n"
-    "  3. USB 真机：保持本机 adb server 运行（127.0.0.1:5037，任一 adb "
-    "客户端连接即会自动拉起）；若设备显示 unauthorized，请在手机弹窗上"
-    "点允许")
+    "  3. USB 真机：保持本机 adb server 运行（127.0.0.1:5037，装过任何 "
+    "adb 客户端/模拟器都会自动拉起）；若设备显示 unauthorized，请在手机"
+    "弹窗上点允许")
 
 
 def _sock_read_exact(sock, n):
@@ -1885,6 +1887,35 @@ def _rsa_sign_sha1(key, token):
     return pow(int.from_bytes(m, "big"), d, n).to_bytes(k, "big")
 
 
+def _adb_cnxn_auth(send, recv):
+    """CNXN 建连 + AUTH 授权公共实现（daemon/USB 两通道共用）。
+    send(cmd, arg0, arg1, payload) / recv() -> (cmd, arg0, arg1, payload)。
+    返回设备宣告的 maxdata；AUTH 纯 Python RSA 签名，新设备先发公钥
+    触发授权弹窗。"""
+    key = _adb_auth_keys()
+    send(_A_CNXN, _A_VERSION, _A_MAXDATA, _A_FEATURES)
+    sent_pub = False
+    for _ in range(6):
+        cmd, arg0, arg1, payload = recv()
+        if cmd == _A_CNXN:
+            return min(max(int(arg1), 4096), _A_MAXDATA)
+        if cmd == _A_AUTH and arg0 == _AUTH_TOKEN:
+            if key is None:
+                raise AdbError("设备要求授权但本机 RSA 密钥不可用（%s）"
+                               % _adb_key_path())
+            if not sent_pub:
+                pub = base64.b64encode(_android_pubkey_blob(key))
+                send(_A_AUTH, _AUTH_PUBKEY, 0, pub + b" mtauto")
+                sent_pub = True
+            send(_A_AUTH, _AUTH_SIGN, 0, _rsa_sign_sha1(key, payload))
+            continue
+        if cmd == _A_AUTH and arg0 == _AUTH_SIGN:
+            continue
+        raise AdbError("设备握手异常（帧 %r）" % cmd)
+    raise AdbError("设备未接受本机密钥授权：请在设备授权弹窗点允许，或先用"
+                   "一次 adb 客户端连接以信任本机密钥（~/.android/adbkey）")
+
+
 # ---------------------------------------------------------------------------
 # 通道 B：直连 adbd 的 A_ 协议实现
 
@@ -2016,31 +2047,10 @@ class _AdbDaemonTransport:
 
     def handshake(self, sock):
         """CNXN 建连 + AUTH 授权（RSA 签名；新设备先发公钥触发授权弹窗）。"""
-        key = _adb_auth_keys()
-        self.send_msg(sock, _A_CNXN, _A_VERSION, _A_MAXDATA, _A_FEATURES)
-        sent_pub = False
-        for _ in range(6):
-            cmd, arg0, arg1, payload = self.recv_msg(sock)
-            if cmd == _A_CNXN:
-                self.maxdata = min(max(int(arg1), 4096), _A_MAXDATA)
-                return True
-            if cmd == _A_AUTH and arg0 == _AUTH_TOKEN:
-                if key is None:
-                    raise AdbError("设备要求授权但本机 RSA 密钥不可用（%s）"
-                                   % _adb_key_path())
-                if not sent_pub:
-                    pub = base64.b64encode(_android_pubkey_blob(key))
-                    self.send_msg(sock, _A_AUTH, _AUTH_PUBKEY, 0,
-                                  pub + b" mtauto")
-                    sent_pub = True
-                self.send_msg(sock, _A_AUTH, _AUTH_SIGN, 0,
-                              _rsa_sign_sha1(key, payload))
-                continue
-            if cmd == _A_AUTH and arg0 == _AUTH_SIGN:
-                continue
-            raise AdbError("设备握手异常（帧 %r）" % cmd)
-        raise AdbError("设备未接受本机密钥授权：请在设备授权弹窗点允许，或先用"
-                       "一次 adb 客户端连接以信任本机密钥（~/.android/adbkey）")
+        self.maxdata = _adb_cnxn_auth(
+            lambda cmd, a0, a1, pl=b"": self.send_msg(sock, cmd, a0, a1, pl),
+            lambda: self.recv_msg(sock))
+        return True
 
     def open_stream(self, service, timeout):
         sock = self.connect_sock(timeout)
@@ -2267,7 +2277,7 @@ class ADB:
     # ---- 命令执行 ----
 
     def run(self, args, timeout=20, check=True):
-        """统一命令入口（与旧 subprocess 版签名/返回值完全兼容）。
+        """统一命令入口（返回值签名与历史版本兼容）。
         args[0]：shell / exec-out / push / install / devices。"""
         args = [str(a) for a in args]
         attempt = 0
@@ -3976,296 +3986,6 @@ def _solve_captcha_via_api(url, image_path, timeout=30):
     raise last_err
 
 
-# ---- 字符码内嵌 OCR（单文件交付：ddddocr 懒加载 + 纯 stdlib 几何定位） ----
-# 设计：不再有独立桥进程/HTTP 端口——几何定位直接跑在主脚本的
-# _png_rows 纯 stdlib PNG 解码上，裁剪用内置 PNG 编码器输出字节喂
-# ddddocr。ddddocr/PIL 均不在交付依赖里：只在真遇到字符码题型时
-# 懒加载 import，缺包自动 pip 安装（镜像兜底链），失败仅失去字符码
-# 兜底，绝不影响主流程的图标点选/拼图/滑块/连线本地求解。
-
-OCR_PIP_MIRRORS = (
-    "https://mirrors.cloud.tencent.com/pypi/simple",
-    "https://mirrors.aliyun.com/pypi/simple",
-    "https://pypi.org/simple",
-)
-OCR_PIP_TIMEOUT = 600          # 自动 pip install 上限（秒）
-# 弹窗几何特征（按屏宽/高比例，与其它检测器同一设计哲学）
-OCR_SEARCH_Y = (0.15, 0.62)    # 中屏纵向搜索窗（避开标题栏/键盘）
-OCR_SEARCH_X = (0.06, 0.94)
-OCR_BAND_H = (0.035, 0.28)     # 验证码图带高度范围（下限须高于单行
-                               # 标题文字 ~0.025H，低于实测字符码
-                               # 图带 ~0.075H 起步）
-OCR_ROW_THR_COLOR = 0.05       # 彩色行判定：高饱和像素占比
-OCR_ROW_THR_DARK = 0.04        # 深色行判定：暗墨像素占比
-OCR_NEIGHBOR_WHITE = 0.5       # 带上下邻行白底占比下限
-OCR_SAT_THR = 45               # 高饱和判定 max(r,g,b)-min(r,g,b)
-OCR_INK_THR = 110              # 暗墨判定亮度上限
-OCR_WHITE_THR = 225            # 白底判定亮度下限
-OCR_MIN_CROP_W = 300           # 裁图宽低于此值最近邻 2 倍放大
-OCR_DET_REGION = (0.05, 0.15, 0.95, 0.65)   # det 兜底搜索区（比例）
-# Yoda 弹窗「刷新」按钮固定位置（vivo 实测：弹窗右下）
-YODA_REFRESH_XY = (0.843, 0.686)
-_OCR_STATE = {"install_tried": False, "ocr": None, "det": None}
-
-
-def _pip_install_ddddocr(log):
-    """用当前解释器对齐安装 ddddocr（必须 sys.executable -m pip，
-    否则多 Python 环境下会装错地方——本机实测踩坑）。"""
-    for mirror in OCR_PIP_MIRRORS:
-        log.info("自动安装 ddddocr（镜像 %s，首次约 1-3 分钟）..." % mirror)
-        try:
-            r = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--no-cache-dir",
-                 "-i", mirror, "--timeout", "60", "--retries", "3",
-                 "ddddocr"],
-                capture_output=True, timeout=OCR_PIP_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            log.warn("pip install 超时（%ds），换下一镜像" % OCR_PIP_TIMEOUT)
-            continue
-        if r.returncode == 0:
-            return True
-        log.warn("该镜像安装失败（rc=%d）：%s"
-                 % (r.returncode, r.stderr.decode("utf-8", "replace")[-300:]))
-    return False
-
-
-def _ocr_ensure_engine(log):
-    """懒加载 ddddocr OCR 引擎；缺包自动安装（每进程只试一次）。
-    成功返回引擎，失败返回 None。"""
-    if _OCR_STATE["ocr"] is not None:
-        return _OCR_STATE["ocr"]
-    try:
-        import ddddocr
-    except ImportError:
-        if _OCR_STATE["install_tried"]:
-            return None
-        _OCR_STATE["install_tried"] = True
-        if not _pip_install_ddddocr(log):
-            log.warn("ddddocr 自动安装失败（可手动：python -m pip "
-                     "install ddddocr）；字符码题型将无识别兜底")
-            return None
-        try:
-            import ddddocr
-        except ImportError:
-            return None
-    eng = ddddocr.DdddOcr(show_ad=False)
-    _OCR_STATE["ocr"] = eng
-    return eng
-
-
-def _ocr_ensure_det(log):
-    """懒加载 ddddocr 目标检测实例（几何定位未命中时的兜底）。"""
-    if _OCR_STATE["det"] is not None:
-        return _OCR_STATE["det"]
-    if _ocr_ensure_engine(log) is None:
-        return None
-    try:
-        import ddddocr
-        det = ddddocr.DdddOcr(det=True, ocr=False, show_ad=False)
-    except Exception as e:
-        log.warn("ddddocr det 模型加载失败（跳过检测兜底）：%s" % e)
-        return None
-    _OCR_STATE["det"] = det
-    return det
-
-
-def _ocr_row_stats(rows_px, bpp, y, x0, x1):
-    """一行内：彩色像素占比、暗墨像素占比（步长 2 采样）。"""
-    colorful = dark = n = 0
-    row = rows_px[y]
-    for x in range(x0, x1, 2):
-        o = x * bpp
-        r, g, b = row[o], row[o + 1], row[o + 2]
-        lum = (r * 299 + g * 587 + b * 114) // 1000
-        mx, mn = max(r, g, b), min(r, g, b)
-        if mx - mn > OCR_SAT_THR and mx > 60:
-            colorful += 1
-        elif lum < OCR_INK_THR:
-            dark += 1
-        n += 1
-    return colorful / float(max(n, 1)), dark / float(max(n, 1))
-
-
-def _ocr_white_frac(rows_px, bpp, y, x0, x1):
-    """一行白底占比（步长 3 采样）。"""
-    n = white = 0
-    row = rows_px[y]
-    for x in range(x0, x1, 3):
-        o = x * bpp
-        r, g, b = row[o], row[o + 1], row[o + 2]
-        if (r * 299 + g * 587 + b * 114) // 1000 > OCR_WHITE_THR:
-            white += 1
-        n += 1
-    return white / float(max(n, 1))
-
-
-def _ocr_bands_from_rows(rows_flag, max_gap=6):
-    """把命中行聚成带（允许 ≤max_gap 行缺口，字符行间有白隙）。"""
-    bands = []
-    for y in sorted(rows_flag):
-        if bands and y - bands[-1][1] <= max_gap:
-            bands[-1][1] = y
-        else:
-            bands.append([y, y])
-    return bands
-
-
-def _ocr_find_char_band(rows_px, bpp, width, height):
-    """定位验证码图带，返回全图坐标 (x0, y0, x1, y1) 或 None。
-    彩色字符带优先，黑白暗墨带兜底；带上下必须紧邻白底（弹窗内
-    图带的白边特征），带内内容列宽 ≥0.12W。"""
-    x0 = int(width * OCR_SEARCH_X[0])
-    x1 = int(width * OCR_SEARCH_X[1])
-    color_rows = set()
-    dark_rows = set()
-    for y in range(int(height * OCR_SEARCH_Y[0]),
-                   int(height * OCR_SEARCH_Y[1])):
-        cf, df = _ocr_row_stats(rows_px, bpp, y, x0, x1)
-        if cf > OCR_ROW_THR_COLOR:
-            color_rows.add(y)
-        elif df > OCR_ROW_THR_DARK:
-            dark_rows.add(y)
-
-    def _band_ok(y0, y1):
-        h = y1 - y0 + 1
-        if not (height * OCR_BAND_H[0] <= h <= height * OCR_BAND_H[1]):
-            return False
-        up, dn = y0 - 6, y1 + 6
-        if up < 0 or dn >= height:
-            return False
-        wup = min(_ocr_white_frac(rows_px, bpp, yy, x0, x1)
-                  for yy in range(up, y0))
-        wdn = min(_ocr_white_frac(rows_px, bpp, yy, x0, x1)
-                  for yy in range(y1 + 1, dn + 1))
-        return min(wup, wdn) > OCR_NEIGHBOR_WHITE
-
-    for rows in (color_rows, dark_rows):   # 彩色优先，暗墨兜底
-        for y0, y1 in _ocr_bands_from_rows(rows):
-            if not _band_ok(y0, y1):
-                continue
-            # 带内列范围：找有内容（彩色或暗墨）的列
-            cx0 = cx1 = None
-            for x in range(x0, x1, 2):
-                hit = False
-                for y in range(y0, y1 + 1, 3):
-                    o = x * bpp
-                    r, g, b = (rows_px[y][o], rows_px[y][o + 1],
-                               rows_px[y][o + 2])
-                    mx, mn = max(r, g, b), min(r, g, b)
-                    lum = (r * 299 + g * 587 + b * 114) // 1000
-                    if (mx - mn > OCR_SAT_THR and mx > 60) or lum < OCR_INK_THR:
-                        hit = True
-                        break
-                if hit:
-                    if cx0 is None:
-                        cx0 = x
-                    cx1 = x
-            if cx0 is None or cx1 - cx0 < width * 0.12:
-                continue
-            pad = 12
-            return (max(0, cx0 - pad), max(0, y0 - pad),
-                    min(width - 1, cx1 + pad), min(height - 1, y1 + pad))
-    return None
-
-
-def _ocr_png_encode(rows_px, bpp, box, min_w=OCR_MIN_CROP_W):
-    """把 rows_px 的 box 区域裁剪编码为 PNG bytes（纯 stdlib，
-    zlib+struct 手写 chunk）。宽度低于 min_w 时最近邻 2 倍放大
-    （小图直接喂 OCR 精度差）。"""
-    x0, y0, x1, y1 = box
-    cw = x1 - x0 + 1
-    scale = 2 if cw < min_w else 1
-    ow, oh = cw * scale, (y1 - y0 + 1) * scale
-    raw = bytearray()
-    base = x0 * bpp
-    for sy in range(y0, y1 + 1):
-        row = rows_px[sy]
-        seg = bytearray()
-        for ox in range(cw):
-            seg += row[base + ox * bpp: base + (ox + 1) * bpp] * scale
-        for _ in range(scale):
-            raw += b"\x00" + bytes(seg)    # 每行前置 filter 0
-    ctype = 6 if bpp == 4 else 2
-
-    def _chunk(typ, payload):
-        return (struct.pack(">I", len(payload)) + typ + payload
-                + struct.pack(">I", zlib.crc32(typ + payload) & 0xFFFFFFFF))
-
-    ihdr = struct.pack(">IIBBBBB", ow, oh, 8, ctype, 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n" + _chunk(b"IHDR", ihdr)
-            + _chunk(b"IDAT", zlib.compress(bytes(raw), 6))
-            + _chunk(b"IEND", b""))
-
-
-def _ocr_det_fallback(det, rows_px, bpp, width, height, log):
-    """det 目标检测兜底：中屏找最大文字簇（相邻簇按 x 间距 < 1.5 倍
-    平均高合并——逐字符检测会把一个验证码拆成 N 个单字框），
-    返回全图坐标 box 或 None。"""
-    rx0 = int(width * OCR_DET_REGION[0])
-    ry0 = int(height * OCR_DET_REGION[1])
-    rx1 = int(width * OCR_DET_REGION[2])
-    ry1 = int(height * OCR_DET_REGION[3])
-    png = _ocr_png_encode(rows_px, bpp, (rx0, ry0, rx1, ry1), min_w=0)
-    try:
-        bboxes = det.detection(png)
-    except Exception as e:
-        log.warn("目标检测兜底失败：%s" % e)
-        return None
-    if not bboxes:
-        return None
-    boxes = sorted([tuple(b) for b in bboxes], key=lambda b: b[0])
-    avg_h = sum(b[3] - b[1] for b in boxes) / float(len(boxes))
-    clusters = []
-    for b in boxes:
-        if clusters and b[0] - clusters[-1][2] < avg_h * 1.5:
-            c = clusters[-1]
-            clusters[-1] = (c[0], min(c[1], b[1]), max(c[2], b[2]),
-                            max(c[3], b[3]))
-        else:
-            clusters.append(b)
-    bx0, by0, bx1, by1 = max(
-        clusters, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
-    return (rx0 + bx0, ry0 + by0, rx0 + bx1, ry0 + by1)
-
-
-def solve_char_captcha_local(image_path, log):
-    """字符验证码本地识别（进程内，零配置）：
-    截图 → _png_rows 纯 stdlib 解码 → 几何定位（彩色字符带 →
-    暗墨字符带 → ddddocr det 兜底）→ 内置 PNG 编码器裁剪（小图
-    2x）→ ddddocr OCR。返回文本或 None。
-    任何失败都返回 None 不抛异常——兜底层不能拖垮主流程。"""
-    try:
-        decoded = _png_rows(image_path)
-    except Exception:
-        return None
-    if decoded is None:
-        return None
-    width, height, bpp, rows_px = decoded
-    eng = _ocr_ensure_engine(log)
-    if eng is None:
-        return None
-    box = _ocr_find_char_band(rows_px, bpp, width, height)
-    if box is not None:
-        log.info("字符码图带定位：%s" % (box,))
-    else:
-        det = _ocr_ensure_det(log)
-        if det is None:
-            return None
-        box = _ocr_det_fallback(det, rows_px, bpp, width, height, log)
-        if box:
-            log.info("det 兜底定位：%s" % (box,))
-        else:
-            log.warn("验证码区域定位失败")
-            return None
-    png = _ocr_png_encode(rows_px, bpp, box)
-    try:
-        text = eng.classification(png)
-    except Exception as e:
-        log.warn("OCR 识别异常：%s" % e)
-        return None
-    return (text or "").strip() or None
-
-
 def sig_diff_ratio(sig_a, sig_b, tol=12):
     if not sig_a or not sig_b or len(sig_a) != len(sig_b):
         return 1.0
@@ -5464,64 +5184,52 @@ class Flow:
             _sleep(random.uniform(1.8, 2.6))
         return False
 
-    def _char_captcha_in_page(self, page):
-        """页面文本是否含字符码（输入文字类）特征——本地 OCR 只对
-        该题型生效；图标点选/空间推理等由 R34 形状匹配求解，混跑
-        OCR 会把照片区域当字符带读出乱码。"""
-        for kw in ("请输入图片", "输入图片字符", "字符验证",
-                   "请输入验证码", "输入验证码", "图形验证码"):
-            if kw in page:
-                return True
-        return False
-
     def handle_yoda_tap_captcha(self):
         """点选类验证（图标点选/文字点选/空间推理/字符输入）处置：
-        0) R34：本地图标点选求解优先（零依赖离线秒级，命中即按序
-           拟人点选；未检出该题型或未解开则落回原路径）；
+        0) R34：本地图标点选求解优先（零依赖离线秒级；每轮都试——
+           刷新可能把题型换成图标点选）；
         1) 配置 captcha_solver_url 时，POST 截图给打码服务：返回坐标
            则按序拟人点选，返回文本则填入验证码输入框；
-        2) 未配置 URL 且页面是字符码（请输入图片字符）→ R36 内嵌
-           ddddocr 本地识别（缺包自动安装，纯离线），文本填入输入框；
+        2) 未配置 URL：纯标准库无法做图像文字识别（零依赖交付，不带
+           任何 OCR 包）——点「刷新」换题，换出图标点选类由 0) 接手，
+           换出滑块/拼图类由外层求解器接手；
         3) 每轮动作后复查弹窗是否消失，最多 max_tap_attempts 轮；
         4) 全部轮次失败则留证并停止，绝不盲点（乱点会升级风控）。"""
         log = self.log
-        try:
-            if self.solve_icon_click_captcha():
-                return
-        except Exception as e:
-            log.warn("本地图标点选求解异常：%s" % e)
         url = (self.cfg.get("captcha_solver_url") or "").strip()
         max_rounds = max(1, int(self.cfg.get("max_tap_attempts", 3)))
         shot = self._shot_path("yoda_tap_captcha.png")
         solved = False
         for rnd in range(1, max_rounds + 1):
+            # 0) 图标点选本地求解（零依赖离线秒级，每轮先试）
             try:
-                self.adb.screencap(shot)
+                if self.solve_icon_click_captcha():
+                    solved = True
+                    log.info("点选验证弹窗已消失（本地图标求解），等待"
+                             "服务端校验")
+                    break
             except Exception as e:
-                log.warn("点选验证截图失败：%s" % e)
-                break
+                log.warn("本地图标点选求解异常：%s" % e)
             if url:
+                try:
+                    self.adb.screencap(shot)
+                except Exception as e:
+                    log.warn("点选验证截图失败：%s" % e)
+                    break
                 try:
                     kind, val = _solve_captcha_via_api(url, shot)
                 except Exception as e:
                     log.warn("打码服务调用失败（第 %d 轮）：%s" % (rnd, e))
                     break
             else:
-                # 本地路径：只对字符码题型出手（防 OCR 读照片出乱码）
-                try:
-                    page0 = self.page_text(self.adb.dump_ui())
-                except Exception as e:
-                    log.warn("页面状态获取失败（第 %d 轮）：%s，停止重试"
-                             % (rnd, e))
-                    break
-                if not self._char_captcha_in_page(page0):
-                    log.info("非字符码题型且无打码服务，本地无法处置")
-                    break
-                text = solve_char_captcha_local(shot, log)
-                if not text:
-                    log.warn("本地字符码识别未出结果（第 %d 轮）" % rnd)
-                    break
-                kind, val = "text", text
+                # 本地路径：点「刷新」换题（与 _stuck_escalate 同源坐标）
+                w2, h2 = self.adb.screen_size()
+                log.info("未配置打码服务，点「刷新」换题（第 %d/%d 轮）"
+                         % (rnd, max_rounds))
+                self._jitter_tap(int(w2 * YODA_REFRESH_XY[0]),
+                                 int(h2 * YODA_REFRESH_XY[1]))
+                _sleep(random.uniform(1.8, 2.6))
+                continue
             if kind == "points" and val:
                 log.info("验证返回 %d 个点选坐标：%s" % (len(val), val))
                 self._tap_points_human(val)
