@@ -5,26 +5,32 @@
 直到页面出现模糊（打星）的姓名与身份证号，自动截图取证。
 
 - **交付物就是本脚本这一个 .py 文件**：所有运行参数已内置为默认值，拿到即可运行
-- 仅依赖 Python 3.8+ 标准库 + adb，不装任何第三方包、不在手机上装任何东西
+- **零 adb.exe 依赖（R37）**：ADB 协议（server 通道 + 直连 adbd 通道）在脚本内用纯
+  标准库 socket 实现，机器上没有 adb 也能跑；仅依赖 Python 3.8+，不装任何第三方包
 - 全流程无人工干预：退出登录、页面导航、填号、读短信验证码、滑块验证、提交全部自动
 - 起点自适应：没装美团会自动下载安装，没打开会自动拉起，停在任意页面会自动归位到流程起点
 
 ## 环境要求
 
-1. Python 3.8+（无 pip 依赖）
-2. adb（Android platform-tools），或用 `--adb` 指定路径
-3. 安卓机开启 USB 调试并连接电脑（vivo 机型还需开「USB 调试（安全设置）」才能模拟点击）
+1. Python 3.8+（无 pip 依赖；字符码兜底题型的 ddddocr 会在首次遇到该题型时自动安装）
+2. 以下任一设备接入方式（自动识别，无需装 adb）：
+   - **模拟器**：启动即可，脚本自动扫描 MuMu/雷电/夜神/逍遥/BlueStacks 常用 adb 端口直连
+   - **真机无线调试**：手机开发者选项开「无线调试」，或执行过一次 `adb tcpip 5555` 的设备，用 `--serial 手机IP:5555` 指定（首次连接手机会弹授权框，点允许）
+   - **USB 真机**：保持本机 adb server 在运行（装过任何 adb 客户端/模拟器都会自动拉起，默认 127.0.0.1:5037）
+3. vivo 机型需开「USB 调试（安全设置）」才能模拟点击
 4. 换绑目标手机号可接收短信
 
 ## 快速开始
 
 ```bash
 # 全自动（唯一必填项：--phone 换绑目标号）
-python auto_change_phone.py --phone 13800001234 --valid-hours 48 \
-    --adb C:/platform-tools/adb.exe
+python auto_change_phone.py --phone 13800001234 --valid-hours 48
 
 # 不带 --phone 直接运行：脚本会在控制台提示，键盘输入 11 位手机号即可
 python auto_change_phone.py
+
+# 多模拟器/指定设备时
+python auto_change_phone.py --phone 13800001234 --serial 127.0.0.1:16384
 
 # 人工已操作到某一步，从当前手机状态直接接管
 python auto_change_phone.py --manual-login
@@ -32,13 +38,25 @@ python auto_change_phone.py --manual-login
 
 成功时控制台输出 `[DELIVERABLE] <取证截图绝对路径>`，退出码 0。
 
+## 设备连接说明（R37 纯 socket 实现）
+
+脚本自身**从不调用 adb.exe**，两条通道自动选择：
+
+| 通道 | 触发条件 | 说明 |
+|------|---------|------|
+| 直连 adbd | `--serial` 给了 `ip:端口` 或 `emulator-N`；或本机无 adb server 时自动扫描模拟器端口 | 脚本直接与设备 adbd 对话（CNXN/AUTH 全协议），机器上完全不需要 adb。AUTH 用 `~/.android/adbkey` RSA 密钥签名（与 adb 官方密钥互通、授权互相生效），无密钥时自动生成 |
+| adb server | 本机 127.0.0.1:5037 已有 adb server 在运行（USB 真机场景；server 由任意 adb 客户端/模拟器自动拉起） | 脚本走 server 的 host 协议 + sync 推送，自身不执行 adb 命令 |
+
+未指定 `--serial` 时的自动顺序：问本机 adb server → 扫描模拟器端口（5555/5557/16384/16416/7555/62001/62025/62027/62029/21503/6555）→ 都没有则报中文指引。
+可用 `--adb-server host:port` 或环境变量 `ANDROID_ADB_SERVER_PORT` 改 server 地址。
+
 ## 命令行参数
 
 | 参数 | 说明 |
 |------|------|
 | `--phone` | 换绑目标手机号（11 位大陆手机号），唯一必填参数；不填时脚本运行中会提示键盘输入 |
-| `--serial` | adb 设备序列号；多台设备时必填，单台自动识别 |
-| `--adb` | adb 可执行文件路径（默认取 PATH 里的 adb，或环境变量 ADB_PATH） |
+| `--serial` | 设备地址：`emulator-5554` / `ip:端口`（直连，无需 adb）/ USB 序列号（需本机 adb server）；多台设备时必填，单台自动识别 |
+| `--adb-server` | 本机 adb server 地址 host:port（默认 127.0.0.1:5037，也可用环境变量 ANDROID_ADB_SERVER_PORT） |
 | `--config` | JSON 配置文件路径，**可选**：与内置默认配置逐字段合并，只写要覆盖的字段 |
 | `--manual-login` | 跳过自动退出登录，从当前手机状态接管 |
 | `--fresh-identity` | 运行前执行**身份重置**：pm clear 清美团数据 + adb 免 root 换新 Android ID + 首启注册全新 dfpId。用于设备被风控关联（滑块反复判负）后以全新设备身份重试；实测换新身份后服务端会改发可解的连线验证而非死拒滑块 |
@@ -148,6 +166,13 @@ python auto_change_phone.py --phone 13800001234 --config my_overrides.json
     仍可配置 `captcha_solver_url` 接超级鹰等付费打码平台（配置后
     走外部服务，不用内嵌 OCR）。端到端实测：整屏截图 → 几何定位
     → 识别 '8347' 精确命中 3.4s（首次含模型加载约 10s 内）
+17. **R37 零 adb.exe 依赖传输层**：ADB 协议纯 socket 重写——server 通道
+    （host 协议 + sync 推送 + exec/raw 中继）覆盖 USB 真机；直连通道
+    （CNXN/AUTH/OPEN/OKAY/WRTE/CLSE 完整实现 + RSA 纯 Python 签名/密钥
+    生成）覆盖模拟器与无线调试真机，机器上没有 adb 也能跑。shell 退出码
+    经 `__MT_RC_` 标记还原，传输中断自动重连（次数同 `adb_recover_attempts`）。
+    密钥与 adb 官方格式互通（PKCS#1/PKCS#8 都认），已与本机官方
+    adbkey.pub 逐字节比对公钥编码
 
 ## 输出说明
 

@@ -5,22 +5,26 @@ import argparse
 import base64
 from collections import deque
 import gzip
+import hashlib
 import json
 import math
 import os
 import random
 import re
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import urllib.request
+import zlib
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
 
-SCRIPT_VERSION = "R36"
+SCRIPT_VERSION = "R37"
 MEITUAN_PKG = "com.sankuai.meituan"
 DUMP_PATH = "/sdcard/mt_auto_uidump.xml"
 TOUCHD_PATH = "/data/local/tmp/touchd"
@@ -1594,70 +1598,765 @@ def _whip_progress(n, rng=None):
     return out
 
 
+# ============================================================================
+# 纯 socket ADB 传输层（R37：零 adb.exe 依赖，仅标准库）
+# ----------------------------------------------------------------------------
+# 脚本自身不调用 adb.exe；两条通道自动选择：
+#   A. server 通道 —— 连接本机已运行的 adb server（127.0.0.1:5037，兼容
+#      ANDROID_ADB_SERVER_PORT 环境变量与 --adb-server）。server 通常由
+#      模拟器自带 adb 自动拉起；USB 真机走此通道。
+#   B. daemon 通道 —— 直接与设备 adbd 的 TCP 监听口对话（模拟器 adb 端口
+#      或真机无线调试/adb tcpip 5555），完整实现 CNXN/AUTH/OPEN/OKAY/
+#      WRTE/CLSE 与 sync 推送；AUTH 用本机 RSA 密钥（~/.android/adbkey，
+#      与 adb 官方密钥互通）纯 Python 签名，无密钥时自动生成。
+#      此通道下机器上完全没有 adb 也能工作。
+# ============================================================================
+
+ADB_SERVER_HOST = "127.0.0.1"
+ADB_SERVER_PORT = int(
+    os.environ.get("ANDROID_ADB_SERVER_PORT", "5037") or 5037)
+
+# daemon 通道自动扫描端口（常见模拟器 adb 监听口）
+_EMULATOR_TCP_PORTS = (
+    5555,      # adb tcpip 5555 / 雷电
+    5557,      # 雷电多开
+    16384,     # MuMu 12
+    16416,     # MuMu 12 多开
+    7555,      # MuMu 6
+    62001,     # 夜神
+    62025, 62027, 62029,   # 夜神多开
+    21503,     # 逍遥
+    6555,      # BlueStacks
+)
+
+_A_CNXN = b"CNXN"
+_A_AUTH = b"AUTH"
+_A_OPEN = b"OPEN"
+_A_OKAY = b"OKAY"
+_A_CLSE = b"CLSE"
+_A_WRTE = b"WRTE"
+_A_VERSION = 0x01000001
+_A_MAXDATA = 262144
+# 不声明任何 feature：adbd 回退 legacy shell 模式（输出不分帧，当原始流读）
+_A_FEATURES = b""
+_AUTH_TOKEN, _AUTH_SIGN, _AUTH_PUBKEY = 1, 2, 3
+
+_SYNC_CHUNK = 65536
+_SYNC_MODE = 0o644
+# shell 退出码标记：adbd 经 /bin/sh -c 执行命令后 echo，客户端剥离还原 rc
+_RC_MARK = b"__MT_RC_"
+_RC_SUFFIX = "; echo __MT_RC_$?"
+
+_NO_DEVICE_MSG = (
+    "未检测到可用 Android 设备，请任选其一后重试：\n"
+    "  1. 启动模拟器（自动扫描 MuMu/雷电/夜神/逍遥/BlueStacks 等常用端口）；\n"
+    "  2. 真机开启「无线调试」或执行一次 adb tcpip 5555 后用 "
+    "--serial ip:5555 指定；\n"
+    "  3. USB 真机：保持本机 adb server 运行（127.0.0.1:5037，任一 adb "
+    "客户端连接即会自动拉起）；若设备显示 unauthorized，请在手机弹窗上"
+    "点允许")
+
+
+def _sock_read_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("设备连接被对端关闭")
+        buf += chunk
+    return bytes(buf)
+
+
+def _sock_recv_all(sock):
+    """读到对端关闭为止（命令结束即连接关闭）。"""
+    buf = bytearray()
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            return bytes(buf)
+        buf += chunk
+
+
+class _RawStream:
+    """server 通道数据流：server 已解帧，套接字即原始字节流。"""
+
+    def __init__(self, sock):
+        self.sock = sock
+
+    def read_exact(self, n):
+        return _sock_read_exact(self.sock, n)
+
+    def read_until_close(self):
+        return _sock_recv_all(self.sock)
+
+    def write(self, data):
+        self.sock.sendall(bytes(data))
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 纯 Python RSA（AUTH 签名/公钥用；密钥与 adb 官方格式互通）
+
+_ADB_SIG_PREFIX = bytes.fromhex("3021300906052b0e03021a05000414")
+
+
+def _der_len(n):
+    if n < 0x80:
+        return bytes([n])
+    b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(b)]) + b
+
+
+def _der_int(v):
+    b = v.to_bytes((v.bit_length() + 8) // 8, "big")   # 高位为 1 时前置 0x00
+    return b"\x02" + _der_len(len(b)) + b
+
+
+def _der_parse(data):
+    pos, out = 0, []
+    while pos < len(data):
+        tag = data[pos]
+        pos += 1
+        ln = data[pos]
+        pos += 1
+        if ln & 0x80:
+            nb = ln & 0x7F
+            ln = int.from_bytes(data[pos:pos + nb], "big")
+            pos += nb
+        out.append((tag, data[pos:pos + ln]))
+        pos += ln
+    return out
+
+
+def _der_parse_rsa_ints(seq):
+    """SEQUENCE 内容 -> RSAPrivateKey 的 9 个整数（自动剥 PKCS#8 包装）。"""
+    items = _der_parse(seq)
+    if len(items) == 3:          # PKCS#8: version + 算法标识 + 内层 DER
+        tag, blob = items[2]
+        seq = blob[1:] if tag == 0x03 else blob   # BIT STRING 去掉首位字节
+        items = _der_parse(seq)
+        if len(items) == 1 and items[0][0] == 0x30:
+            items = _der_parse(items[0][1])
+    return [int.from_bytes(v, "big") for _, v in items]
+
+
+def _rsa_to_pem(key):
+    ints = (0, key["n"], key["e"], key["d"], key["p"], key["q"],
+            key["dp"], key["dq"], key["qi"])
+    body = b"".join(_der_int(v) for v in ints)
+    der = b"\x30" + _der_len(len(body)) + body
+    b64 = base64.b64encode(der).decode("ascii")
+    lines = "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+    return ("-----BEGIN RSA PRIVATE KEY-----\n%s\n"
+            "-----END RSA PRIVATE KEY-----\n" % lines)
+
+
+def _rsa_from_pem(text):
+    """兼容 PKCS#1（BEGIN RSA PRIVATE KEY）与 PKCS#8（BEGIN PRIVATE KEY，
+    新版 adb 所写）。解析失败返回 None。"""
+    m = re.search(r"-----BEGIN (?:RSA )?PRIVATE KEY-----(.*?)-----END",
+                  text, re.S)
+    if not m:
+        return None
+    try:
+        der = base64.b64decode("".join(m.group(1).split()))
+        top = _der_parse(der)
+        if not top or top[0][0] != 0x30:
+            return None
+        vals = _der_parse_rsa_ints(top[0][1])
+        if len(vals) != 9:
+            return None
+        version, n, e, d, p, q, dp, dq, qi = vals
+        if n.bit_length() < 128 or d <= 0:
+            return None
+        return {"n": n, "e": e, "d": d, "p": p, "q": q,
+                "dp": dp, "dq": dq, "qi": qi}
+    except (ValueError, IndexError, ZeroDivisionError, struct.error):
+        return None
+
+
+def _miller_rabin(n, rounds=40):
+    for p in (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37):
+        if n % p == 0:
+            return n == p
+    d = n - 1
+    r = 0
+    while d % 2 == 0:
+        d //= 2
+        r += 1
+    for _ in range(rounds):
+        a = random.randrange(2, n - 2)
+        x = pow(a, d, n)
+        if x in (1, n - 1):
+            continue
+        for _ in range(r - 1):
+            x = x * x % n
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def _gen_prime(bits):
+    while True:
+        cand = random.getrandbits(bits) | (1 << (bits - 1)) | 1
+        if _miller_rabin(cand):
+            return cand
+
+
+def _rsa_generate(bits=2048):
+    e = 65537
+    while True:
+        p = _gen_prime(bits // 2)
+        q = _gen_prime(bits // 2)
+        if p == q:
+            continue
+        n = p * q
+        if n.bit_length() != bits:
+            continue
+        phi = (p - 1) * (q - 1)
+        if math.gcd(e, phi) != 1:
+            continue
+        d = pow(e, -1, phi)
+        return {"n": n, "e": e, "d": d, "p": p, "q": q,
+                "dp": d % (p - 1), "dq": d % (q - 1), "qi": pow(q, -1, p)}
+
+
+def _adb_key_path():
+    return os.path.join(os.path.expanduser("~"), ".android", "adbkey")
+
+
+def _android_pubkey_blob(key):
+    """ANDROID_PUBKEY_ENCODE 格式（已与本机官方 adbkey.pub 逐字节比对）：
+    len/n0inv/n/rr/exponent 全小端；n0inv = -1/n mod 2^32，rr = R^2 mod n
+    （R = 2^(8k)）。"""
+    n, e = key["n"], key["e"]
+    k = (n.bit_length() + 7) // 8
+    n0inv = (-pow(n, -1, 1 << 32)) % (1 << 32)
+    rr = pow(2, 2 * k * 8, n)
+    return (struct.pack("<II", k // 4, n0inv)
+            + n.to_bytes(k, "little")
+            + rr.to_bytes(k, "little")
+            + struct.pack("<I", e))
+
+
+def _adb_auth_keys():
+    """加载本机 RSA 密钥（~/.android/adbkey，adb 官方同路径同格式，两边的
+    授权互相生效）；缺失则生成并落盘。失败返回 None。"""
+    path = _adb_key_path()
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="ascii", errors="ignore") as f:
+                key = _rsa_from_pem(f.read())
+            if key:
+                return key
+    except OSError:
+        pass
+    try:
+        key = _rsa_generate()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="ascii") as f:
+            f.write(_rsa_to_pem(key))
+        try:
+            pub = base64.b64encode(_android_pubkey_blob(key))
+            with open(path + ".pub", "wb") as f:
+                f.write(pub + b" mtauto@"
+                        + socket.gethostname().encode("utf-8", "ignore")
+                        + b"\n")
+        except OSError:
+            pass
+        return key
+    except Exception:
+        return None
+
+
+def _rsa_sign_sha1(key, token):
+    """PKCS#1 v1.5 + SHA-1（adb AUTH TOKEN 标准签名算法）。"""
+    n, d = key["n"], key["d"]
+    k = (n.bit_length() + 7) // 8
+    t = _ADB_SIG_PREFIX + hashlib.sha1(token).digest()
+    m = b"\x00\x01" + b"\xff" * (k - 3 - len(t)) + b"\x00" + t
+    return pow(int.from_bytes(m, "big"), d, n).to_bytes(k, "big")
+
+
+# ---------------------------------------------------------------------------
+# 通道 B：直连 adbd 的 A_ 协议实现
+
+
+class _FramedStream:
+    """daemon 通道双向流（OPEN/OKAY/WRTE/CLSE 帧）。"""
+
+    def __init__(self, transport, sock, local_id):
+        self.t = transport
+        self.sock = sock
+        self.local_id = local_id
+        self.remote_id = None
+        self._buf = bytearray()
+        self._eof = False
+
+    def _ack(self, remote_id):
+        self.t.send_msg(self.sock, _A_OKAY, self.local_id, remote_id)
+
+    def _recv_dispatch(self):
+        """读一帧并处理控制逻辑，WRTE 数据入缓冲。连接关闭返回 False。"""
+        cmd, arg0, arg1, payload = self.t.recv_msg(self.sock)
+        if cmd == _A_OKAY:
+            self.remote_id = arg0
+        elif cmd == _A_WRTE:
+            self.remote_id = arg1
+            self._ack(arg0)
+            self._buf += payload
+        elif cmd == _A_CLSE:
+            self._eof = True
+            return False
+        else:
+            raise AdbError("设备流帧异常（%r）" % cmd)
+        return True
+
+    def wait_open(self):
+        while self.remote_id is None:
+            if not self._recv_dispatch():
+                raise AdbError("设备拒绝打开服务（可能未授权或不支持）")
+
+    def read_exact(self, n):
+        while len(self._buf) < n and not self._eof:
+            try:
+                self._recv_dispatch()
+            except ConnectionError:
+                self._eof = True
+        if len(self._buf) < n:
+            raise AdbError("设备数据流提前关闭（缺 %d/%d 字节）"
+                           % (n - len(self._buf), n))
+        out = bytes(self._buf[:n])
+        del self._buf[:n]
+        return out
+
+    def read_until_close(self):
+        while not self._eof:
+            try:
+                self._recv_dispatch()
+            except ConnectionError:
+                self._eof = True
+        out = bytes(self._buf)
+        self._buf.clear()
+        return out
+
+    def write(self, data):
+        if self.remote_id is None:
+            raise AdbError("设备数据流未建立")
+        view = memoryview(data)
+        step = max(4096, min(self.t.maxdata, _A_MAXDATA))
+        for i in range(0, len(view), step):
+            self.t.send_msg(self.sock, _A_WRTE, self.local_id,
+                            self.remote_id, view[i:i + step])
+            acked = False
+            while not acked:
+                cmd, arg0, arg1, payload = self.t.recv_msg(self.sock)
+                if cmd == _A_OKAY:
+                    acked = True
+                elif cmd == _A_WRTE:     # 设备输出（如 pty 回显）暂存
+                    self._ack(arg0)
+                    self._buf += payload
+                elif cmd == _A_CLSE:
+                    self._eof = True
+                    raise AdbError("设备在写入过程中关闭连接")
+                else:
+                    raise AdbError("设备流帧异常（%r）" % cmd)
+
+    def close(self):
+        try:
+            if self.remote_id is not None:
+                self.t.send_msg(self.sock, _A_CLSE, self.local_id,
+                                self.remote_id)
+        except (OSError, AdbError):
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class _AdbDaemonTransport:
+    """通道 B：直连设备 adbd TCP 口，无需 adb server。"""
+
+    def __init__(self, host, port, serial=None, log=None):
+        self.host = host or "127.0.0.1"
+        self.port = int(port)
+        self.serial = serial or "%s:%d" % (self.host, self.port)
+        self.log = log or Logger()
+        self.maxdata = _A_MAXDATA
+        self._id = random.randrange(1, 1 << 30)
+
+    def connect_sock(self, timeout):
+        return socket.create_connection((self.host, self.port),
+                                        timeout=timeout)
+
+    @staticmethod
+    def send_msg(sock, cmd, arg0, arg1, payload=b""):
+        cmd_id = struct.unpack("<I", cmd)[0]
+        hdr = struct.pack("<4sIIIII", cmd, arg0, arg1, len(payload),
+                          sum(payload) & 0xFFFFFFFF, cmd_id ^ 0xFFFFFFFF)
+        sock.sendall(hdr + bytes(payload))
+
+    def recv_msg(self, sock):
+        hdr = _sock_read_exact(sock, 24)
+        cmd, arg0, arg1, dlen, cksum, magic = struct.unpack("<4sIIIII", hdr)
+        payload = _sock_read_exact(sock, dlen) if dlen else b""
+        if magic != struct.unpack("<I", cmd)[0] ^ 0xFFFFFFFF:
+            raise AdbError("ADB 协议帧损坏（magic 不匹配）")
+        if dlen and (sum(payload) & 0xFFFFFFFF) != cksum:
+            raise AdbError("ADB 协议帧损坏（校验和不匹配）")
+        return cmd, arg0, arg1, payload
+
+    def handshake(self, sock):
+        """CNXN 建连 + AUTH 授权（RSA 签名；新设备先发公钥触发授权弹窗）。"""
+        key = _adb_auth_keys()
+        self.send_msg(sock, _A_CNXN, _A_VERSION, _A_MAXDATA, _A_FEATURES)
+        sent_pub = False
+        for _ in range(6):
+            cmd, arg0, arg1, payload = self.recv_msg(sock)
+            if cmd == _A_CNXN:
+                self.maxdata = min(max(int(arg1), 4096), _A_MAXDATA)
+                return True
+            if cmd == _A_AUTH and arg0 == _AUTH_TOKEN:
+                if key is None:
+                    raise AdbError("设备要求授权但本机 RSA 密钥不可用（%s）"
+                                   % _adb_key_path())
+                if not sent_pub:
+                    pub = base64.b64encode(_android_pubkey_blob(key))
+                    self.send_msg(sock, _A_AUTH, _AUTH_PUBKEY, 0,
+                                  pub + b" mtauto")
+                    sent_pub = True
+                self.send_msg(sock, _A_AUTH, _AUTH_SIGN, 0,
+                              _rsa_sign_sha1(key, payload))
+                continue
+            if cmd == _A_AUTH and arg0 == _AUTH_SIGN:
+                continue
+            raise AdbError("设备握手异常（帧 %r）" % cmd)
+        raise AdbError("设备未接受本机密钥授权：请在设备授权弹窗点允许，或先用"
+                       "一次 adb 客户端连接以信任本机密钥（~/.android/adbkey）")
+
+    def open_stream(self, service, timeout):
+        sock = self.connect_sock(timeout)
+        try:
+            sock.settimeout(timeout)
+            self.handshake(sock)
+            self._id = (self._id % (1 << 30)) + 1
+            stream = _FramedStream(self, sock, self._id)
+            self.send_msg(sock, _A_OPEN, self._id, 0,
+                          service.encode("utf-8"))
+            stream.wait_open()
+            return stream
+        except Exception:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+
+    def device_list(self):
+        """握手探测已知地址，成功返回 [(serial, "device")]。"""
+        try:
+            sock = self.connect_sock(2.0)
+        except OSError:
+            return []
+        try:
+            sock.settimeout(3.0)
+            self.handshake(sock)
+            return [(self.serial, "device")]
+        except (OSError, AdbError, struct.error):
+            return []
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def devices_body(self):
+        return (self.serial + "\tdevice\n").encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 通道 A：与本机 adb server 对话（脚本自身零 adb.exe 调用）
+
+
+class _AdbServerTransport:
+    """host 协议（hex 长度前缀服务串）+ raw 中继数据流。"""
+
+    def __init__(self, host, port, serial=None, log=None):
+        self.host = host or ADB_SERVER_HOST
+        self.port = int(port or ADB_SERVER_PORT)
+        self.serial = serial
+        self.log = log or Logger()
+
+    def _connect(self, timeout=8.0):
+        sock = socket.create_connection((self.host, self.port),
+                                        timeout=timeout)
+        sock.settimeout(timeout)   # 覆盖后续 _status/read（默认无限阻塞）
+        return sock
+
+    @staticmethod
+    def _send_service(sock, service):
+        data = service.encode("utf-8")
+        sock.sendall(("%04x" % len(data)).encode("ascii") + data)
+
+    def _status(self, sock):
+        resp = _sock_read_exact(sock, 4)
+        if resp == b"OKAY":
+            return
+        if resp == b"FAIL":
+            msg_len = int(_sock_read_exact(sock, 4), 16)
+            msg = _sock_read_exact(sock, msg_len).decode("utf-8", "replace")
+            raise AdbError("adb server 拒绝（%s）" % msg)
+        raise AdbError("adb server 响应异常（%r）" % resp)
+
+    def _open_transport(self):
+        sock = self._connect()
+        target = ("host:transport:%s" % self.serial if self.serial
+                  else "host:transport-any")
+        try:
+            self._send_service(sock, target)
+            self._status(sock)
+            return sock
+        except Exception:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+
+    def open_stream(self, service, timeout):
+        sock = self._open_transport()
+        try:
+            sock.settimeout(timeout)
+            self._send_service(sock, service)
+            self._status(sock)
+            return _RawStream(sock)
+        except Exception:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise
+
+    def device_list(self):
+        sock = self._connect()
+        try:
+            sock.settimeout(5.0)
+            self._send_service(sock, "host:devices")
+            body_len = int(_sock_read_exact(sock, 4), 16)
+            body = _sock_read_exact(sock, body_len).decode("utf-8", "replace")
+            out = []
+            for line in body.splitlines():
+                parts = line.strip().split("\t")
+                if len(parts) >= 2:
+                    out.append((parts[0], parts[1]))
+            return out
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def devices_body(self):
+        rows = self.device_list()
+        return "".join("%s\t%s\n" % (s, st) for s, st in rows).encode("utf-8")
+
+
+def _sync_push(stream, remote_path, data, mode=_SYNC_MODE):
+    """sync 协议写文件到设备（走已建立的 sync: 服务流）。"""
+    def _frame(cmd, payload=b""):
+        stream.write(cmd + struct.pack("<I", len(payload)) + payload)
+
+    _frame(b"SEND", remote_path.encode("utf-8") + struct.pack("<I", mode))
+    for i in range(0, len(data), _SYNC_CHUNK):
+        _frame(b"DATA", data[i:i + _SYNC_CHUNK])
+    _frame(b"DONE", struct.pack("<I", int(time.time())))
+    # sync 协议回执：OKAY 仅 4 字节；FAIL 带 4 字节长度 + 错误串
+    rid = stream.read_exact(4)
+    if rid == b"FAIL":
+        plen = struct.unpack("<I", stream.read_exact(4))[0]
+        msg = stream.read_exact(plen).decode("utf-8", "replace")
+        raise AdbError("设备端写入失败：%s" % msg)
+    if rid != b"OKAY":
+        raise AdbError("sync 协议响应异常（%r）" % rid)
+
+
+def _strip_rc(out):
+    """剥离 shell 退出码标记，还原远端返回码；标记缺失（老设备/二进制
+    输出）时按 0 处理。"""
+    m = re.search(rb"__MT_RC_(\d+)[\r\n\s]*$", out)
+    if m:
+        return int(m.group(1)), out[:m.start()]
+    return 0, out
+
+
 class ADB:
 
     _TRANSPORT_ERR_RE = re.compile(
         r"device\s*(?:['\"]?[\w.\-:]+['\"]?\s+)?(?:offline|not found)"
         r"|error:\s*(?:closed|protocol fault|device offline)", re.I)
 
-    def __init__(self, serial=None, adb_path="adb", logger=None,
+    def __init__(self, serial=None, adb_server=None, logger=None,
                  recover_attempts=2):
         self.serial = serial
-        self.adb_path = adb_path
-
+        if adb_server:
+            host, port = adb_server
+        else:
+            host, port = ADB_SERVER_HOST, ADB_SERVER_PORT
+        self.adb_server = (host, int(port))
         self.log = logger or Logger()
-
         self.recover_attempts = max(0, int(recover_attempts))
+        self._transport = None
 
-    def _base(self):
-        cmd = [self.adb_path]
+    # ---- 传输通道解析 ----
+
+    def _scan_daemon_ports(self):
+        """server 不可用/无设备时，直扫常见模拟器 adb 端口。"""
+        for port in _EMULATOR_TCP_PORTS:
+            t = _AdbDaemonTransport("127.0.0.1", port, log=self.log)
+            if t.device_list():
+                self.log.info("直连设备成功：127.0.0.1:%d（模拟器 adb 端口）"
+                              % port)
+                return t
+        return None
+
+    def _resolve_transport(self):
+        if self._transport is not None:
+            return self._transport
         if self.serial:
-            cmd += ["-s", self.serial]
-        return cmd
-
-    def _recover_server(self):
+            m = re.fullmatch(r"emulator-(\d+)", self.serial)
+            if m:
+                t = _AdbDaemonTransport("127.0.0.1",
+                                        5555 + 2 * int(m.group(1)),
+                                        serial=self.serial, log=self.log)
+            else:
+                m = re.fullmatch(r"(.+):(\d+)", self.serial)
+                if m:
+                    t = _AdbDaemonTransport(m.group(1), int(m.group(2)),
+                                            log=self.log)
+                else:
+                    t = _AdbServerTransport(*self.adb_server,
+                                            serial=self.serial, log=self.log)
+            self._transport = t
+            return t
+        # 未指定 serial：先问本机 server，失败再扫模拟器端口
+        server = _AdbServerTransport(*self.adb_server, log=self.log)
         try:
-            self.log.warn("检测到 adb 传输层错误，执行自愈"
-                          "（kill-server -> start-server）...")
-            subprocess.run([self.adb_path, "kill-server"],
-                           capture_output=True, timeout=10)
-            _sleep(1.0)
-            subprocess.run([self.adb_path, "start-server"],
-                           capture_output=True, timeout=15)
-            wf = [self.adb_path]
-            if self.serial:
-                wf += ["-s", self.serial]
-            wf.append("wait-for-device")
-            subprocess.run(wf, capture_output=True, timeout=15)
-            self.log.warn("adb 自愈完成，重试原命令")
-        except (OSError, subprocess.SubprocessError) as e:
-            self.log.warn("adb 自愈未完成（%s），继续重试原命令" % e)
+            devs = [s for s, st in server.device_list() if st == "device"]
+        except (OSError, AdbError):
+            devs = []
+        if devs:
+            self.serial = devs[0]
+            server.serial = devs[0]
+            self._transport = server
+            return server
+        daemon = self._scan_daemon_ports()
+        if daemon is not None:
+            self.serial = daemon.serial
+            self._transport = daemon
+            return daemon
+        raise AdbError(_NO_DEVICE_MSG)
+
+    # ---- 命令执行 ----
 
     def run(self, args, timeout=20, check=True):
-        cmd = self._base() + list(args)
+        """统一命令入口（与旧 subprocess 版签名/返回值完全兼容）。
+        args[0]：shell / exec-out / push / install / devices。"""
+        args = [str(a) for a in args]
         attempt = 0
         while True:
             try:
-                p = subprocess.run(cmd, capture_output=True, timeout=timeout)
-            except FileNotFoundError:
-                raise AdbError("找不到 adb 可执行文件（%s），请先安装 platform-tools 并加入 PATH" % self.adb_path)
-            except subprocess.TimeoutExpired:
-                raise AdbError("adb 命令超时: %s" % " ".join(cmd))
-            err = p.stderr.decode("utf-8", errors="replace").strip()
-            if check and p.returncode != 0:
-                if (attempt < self.recover_attempts
-                        and self._TRANSPORT_ERR_RE.search(err)):
+                out, err, rc = self._run_once(args, timeout)
+                if check and rc != 0:
+                    msg = (out or b"").decode("utf-8", "replace").strip()
+                    e = AdbError("设备命令失败(rc=%d): %s | %s"
+                                 % (rc, " ".join(args), msg[-300:]))
+                    e.no_retry = True
+                    raise e
+                return out, err, rc
+            except (OSError, ConnectionError) as e:
+                if attempt < self.recover_attempts:
                     attempt += 1
-                    self._recover_server()
+                    self._transport = None
+                    self.log.warn("设备连接中断（%s），重连重试（%d/%d）..."
+                                  % (e, attempt, self.recover_attempts))
+                    _sleep(min(1.0 + attempt, 3.0))
                     continue
-                raise AdbError("adb 命令失败(%d): %s | stderr: %s"
-                               % (p.returncode, " ".join(cmd), err))
-            return p.stdout, err, p.returncode
+                raise AdbError("设备连接中断（%s）" % e)
+            except AdbError as e:
+                if (not getattr(e, "no_retry", False)
+                        and attempt < self.recover_attempts
+                        and self._TRANSPORT_ERR_RE.search(str(e))):
+                    attempt += 1
+                    self._transport = None
+                    self.log.warn("检测到 ADB 传输层错误（%s），重连重试"
+                                  "（%d/%d）..." % (str(e)[:120], attempt,
+                                                    self.recover_attempts))
+                    _sleep(1.0)
+                    continue
+                raise
+
+    def _run_once(self, args, timeout):
+        op = args[0]
+        if op == "shell":
+            out = self._stream_read("shell:" + " ".join(args[1:])
+                                    + _RC_SUFFIX, timeout)
+            rc, out = _strip_rc(out)
+            return out, "", rc
+        if op == "exec-out":
+            out = self._stream_read("exec:" + " ".join(args[1:]), timeout)
+            return out, "", 0
+        if op == "push":
+            self._push_file(args[1], args[2], timeout)
+            return b"", "", 0
+        if op == "install":
+            flags, apk = args[1:-1], args[-1]
+            remote = "/data/local/tmp/mt_auto_install.apk"
+            self._push_file(apk, remote, timeout)
+            return self.run(["shell", "pm", "install"] + flags + [remote],
+                            timeout=timeout, check=False)
+        if op == "devices":
+            return self._devices_text(), "", 0
+        raise AdbError("不支持的设备操作：%s" % op)
+
+    def _stream_read(self, service, timeout):
+        stream = self._resolve_transport().open_stream(service, timeout)
+        try:
+            return stream.read_until_close()
+        finally:
+            stream.close()
+
+    def _push_file(self, local_path, remote_path, timeout):
+        with open(local_path, "rb") as f:
+            data = f.read()
+        stream = self._resolve_transport().open_stream("sync:", timeout)
+        try:
+            _sync_push(stream, remote_path, data)
+        finally:
+            stream.close()
+
+    def _devices_text(self):
+        try:
+            return self._resolve_transport().devices_body()
+        except AdbError:
+            return b""
 
     def list_devices(self):
-        out, _, _ = self.run(["devices"])
+        try:
+            out, _, _ = self.run(["devices"])
+        except AdbError:
+            return []
         devices = []
-        for line in out.decode("utf-8", errors="replace").splitlines()[1:]:
+        # server 的 host:devices 响应可能带也可能不带表头行，逐行按
+        # 「serial\tstate」解析，len>=2 的行才收（表头/提示行自动滤除）
+        for line in out.decode("utf-8", errors="replace").splitlines():
             line = line.strip()
             if line and not line.startswith("*"):
                 parts = line.split()
@@ -1950,34 +2649,24 @@ class ADB:
         rng = random
         w, h = self.screen_size()
         pts = self._build_touch_points(x1, y1, x2, y2, w, h, rng, steps)
-        proc = subprocess.Popen(
-            self._base() + ["shell", TOUCHD_PATH],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL)
+        # 持久 shell 流喂指令（touchd 从 stdin 逐行读取），等价旧 Popen 管道
+        stream = self._resolve_transport().open_stream(
+            "shell:" + TOUCHD_PATH, timeout=120)
         try:
-            proc.stdin.write(b"s %d %d\n" % (w, h))
-            proc.stdin.flush()
+            stream.write(b"s %d %d\n" % (w, h))
             _sleep(0.35)
             for op, x, y, dt in pts:
                 if op == "d":
-                    proc.stdin.write(b"d %d %d\n" % (x, y))
+                    stream.write(b"d %d %d\n" % (x, y))
                 elif op == "m":
-                    proc.stdin.write(b"m %d %d\n" % (x, y))
+                    stream.write(b"m %d %d\n" % (x, y))
                 else:
-                    proc.stdin.write(b"u\n")
-                proc.stdin.flush()
+                    stream.write(b"u\n")
                 if dt:
                     _sleep(dt)
-            proc.stdin.write(b"q\n")
-            proc.stdin.flush()
-            proc.stdin.close()
-            proc.wait(timeout=10)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            raise
+            stream.write(b"q\n")
+        finally:
+            stream.close()
 
     def key_back(self):
         self.run(["shell", "input", "keyevent", "4"])
@@ -2285,8 +2974,6 @@ class Validity:
 
 
 def _png_rows(path):
-    import struct
-    import zlib
     with open(path, "rb") as f:
         data = f.read()
     if data[:8] != b"\x89PNG\r\n\x1a\n":
@@ -3485,8 +4172,6 @@ def _ocr_png_encode(rows_px, bpp, box, min_w=OCR_MIN_CROP_W):
     """把 rows_px 的 box 区域裁剪编码为 PNG bytes（纯 stdlib，
     zlib+struct 手写 chunk）。宽度低于 min_w 时最近邻 2 倍放大
     （小图直接喂 OCR 精度差）。"""
-    import struct
-    import zlib
     x0, y0, x1, y1 = box
     cw = x1 - x0 + 1
     scale = 2 if cw < min_w else 1
@@ -5518,8 +6203,14 @@ def main():
     ap = _ConfigArgumentParser(description="美团更换手机号流程自动化")
     ap.add_argument("--phone", help="登录手机号（不填则在运行中提示输入，"
                                     "或用 --manual-login 从当前状态接管）")
-    ap.add_argument("--serial", help="adb 设备序列号；多设备时必填，单设备自动取")
-    ap.add_argument("--adb", default=os.environ.get("ADB_PATH", "adb"), help="adb 可执行文件路径")
+    ap.add_argument("--serial", help="设备地址：emulator-5554 / ip:端口 "
+                                    "（模拟器或无线调试直连，无需 adb）/ "
+                                    "USB 序列号（需本机 adb server）；"
+                                    "多设备时必填，单设备自动取")
+    ap.add_argument("--adb-server", default=None,
+                    help="本机 adb server 地址 host:port（默认 "
+                         "127.0.0.1:%d，也可用环境变量 "
+                         "ANDROID_ADB_SERVER_PORT）" % ADB_SERVER_PORT)
     ap.add_argument("--config",
                     help="JSON 配置文件路径（与内置默认配置逐字段合并，"
                          "只写要覆盖的字段；不指定即用内置默认值）")
@@ -5566,15 +6257,24 @@ def main():
     net_obs = None
     adb = None
 
+    adb_server = None
+    if args.adb_server:
+        m = re.fullmatch(r"([\w.\-]+):(\d+)", args.adb_server.strip())
+        if not m:
+            print("参数错误：--adb-server 应为 host:port（如 "
+                  "127.0.0.1:5037）", file=sys.stderr)
+            sys.exit(EXIT_CONFIG)
+        adb_server = (m.group(1), int(m.group(2)))
+
     try:
         if not Validity(float(cfg.get("valid_hours", 0)), log).check():
             sys.exit(EXIT_CONFIG)
 
-        adb = ADB(serial=args.serial, adb_path=args.adb, logger=log,
+        adb = ADB(serial=args.serial, adb_server=adb_server, logger=log,
                   recover_attempts=cfg.get("adb_recover_attempts", 2))
         devices = adb.list_devices()
         if not devices:
-            log.error("未检测到 adb 设备，请连接手机并开启 USB 调试后重试")
+            log.error(_NO_DEVICE_MSG)
             sys.exit(EXIT_NO_DEVICE)
         if not adb.serial:
             if len(devices) > 1:
